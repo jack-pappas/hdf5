@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 #include "hdf5.h"
 #include "blosc_filter.h"
 
@@ -50,12 +51,81 @@
 #define H5Z_16API 1
 #endif
 
+/* Function prototypes */
+
 size_t blosc_filter(unsigned flags, size_t cd_nelmts,
                     const unsigned cd_values[], size_t nbytes,
                     size_t *buf_size, void **buf);
 
 herr_t blosc_set_local(hid_t dcpl, hid_t type, hid_t space);
 
+
+/* Variables for managing thread-specific blosc contexts.
+   Using a context specific to each calling thread avoids the need
+   to synchronize access to blosc calls with a global lock. */
+
+/**
+ * Key for getting/setting the thread-local blosc context.
+ */
+static pthread_key_t blosc_ctx_tls_key;
+/**
+ * Used to ensure \link #blosc_ctx_tls_key is only initialized once.
+ */
+static pthread_once_t blosc_ctx_tls_key_once = PTHREAD_ONCE_INIT;
+
+/* TEMP: Provide this typedef from blosc.h */
+typedef int blosc_context;
+typedef blosc_context* blosc_context_handle;
+
+/**
+ * Destroys a thread-local blosc context handle when a thread is exiting.
+ */
+static void
+destroy_blosc_ctx(void* const ptr)
+{
+    /* 'ptr' is actually the blosc context handle. */
+    blosc_context_handle blosc_ctx_handle = (blosc_context_handle)ptr;
+
+    /* TODO: Re-implement this correctly using functions from blosc.h.
+       The code below is just a placeholder for testing purposes. */
+    free(blosc_ctx_handle);
+}
+
+
+static void
+create_blosc_ctx_tls_key()
+{
+    /* TODO: Check the return value of pthread_key_create, and if it's non-zero,
+       report the error in some way (perhaps via the HDF5 macros). */
+    (void)pthread_key_create(&blosc_ctx_tls_key, destroy_blosc_ctx);
+}
+
+/**
+ * Get the blosc context handle from the thread-local storage slot.
+ * If the context hasn't yet been created for this thread, it is created
+ * before returning.
+ */
+static int
+get_blosc_ctx_tls(blosc_context_handle* blosc_ctx_handle)
+{
+    int result;
+    blosc_context_handle handle;
+    if ((handle = (blosc_context_handle)pthread_getspecific(blosc_ctx_tls_key)) == NULL) {
+        /* The blosc context hasn't been created for this thread, so create it. */
+        handle = (blosc_context_handle)malloc(sizeof(blosc_context)); /* TODO: Create this via some blosc call.
+                                                                          This malloc is just a placeholder! */
+
+        /* Store the context handle to the thread-local storage slot. */
+        if ((result = pthread_setspecific(blosc_ctx_tls_key, (void*)handle)) != 0) {
+            *blosc_ctx_handle = NULL;
+            return result;
+        }
+    }
+
+    /* Store the context handle before returning. */
+    *blosc_ctx_handle = handle;
+    return 0;
+}
 
 /* Register the filter, passing on the HDF5 return value */
 int register_blosc(char **version, char **date){
@@ -88,6 +158,10 @@ int register_blosc(char **version, char **date){
     }
     *version = strdup(BLOSC_VERSION_STRING);
     *date = strdup(BLOSC_VERSION_DATE);
+
+    /* Initialize the thread-local storage key for blosc contexts. */
+    (void) pthread_once(&blosc_ctx_tls_key_once, create_blosc_ctx_tls_key);
+
     return 1; /* lib is available */
 }
 
